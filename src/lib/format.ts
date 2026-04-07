@@ -57,6 +57,23 @@ export function fromInputDate(value: string): string {
   return `${day}/${month}/${year}`;
 }
 
+export function formatEntryDateMeta(dateValue: string, purchaseTime = ""): string {
+  if (!dateValue) {
+    return "";
+  }
+
+  const [day, month, year] = dateValue.split("/");
+  if (!day || !month || !year) {
+    return purchaseTime ? `${dateValue} - ${purchaseTime}` : dateValue;
+  }
+
+  const parsedDate = new Date(Number(year), Number(month) - 1, Number(day));
+  const weekdayMap = ["dom", "seg", "ter", "qua", "qui", "sex", "sab"];
+  const weekday = weekdayMap[parsedDate.getDay()] ?? "";
+
+  return [weekday, purchaseTime].filter(Boolean).join(" - ");
+}
+
 export function slugify(value: string): string {
   return normalizeText(value).replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 }

@@ -1,7 +1,7 @@
 import { GlobalWorkerOptions, getDocument } from "pdfjs-dist";
 import pdfWorker from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import type { InvoiceDraft, InvoiceEntry } from "../types";
-import { pickLearnedCategory, type CategoryRules } from "./categoryLearning";
+import { pickLearnedValues, type MerchantLearningRules } from "./categoryLearning";
 import { normalizeText, slugify } from "./format";
 
 GlobalWorkerOptions.workerSrc = pdfWorker;
@@ -21,7 +21,7 @@ type AmountMatch = {
 
 const CATEGORY_MAP: Array<{ match: string[]; category: string }> = [
   { match: ["mercado", "supermercado", "atacadao", "carrefour", "assai"], category: "Mercado" },
-  { match: ["ifood", "restaurante", "lanch", "padaria", "cafeteria"], category: "Alimentacao" },
+  { match: ["ifood", "restaurante", "lanche", "padaria", "cafeteria","galeto"], category: "Alimentacao" },
   { match: ["uber", "99", "posto", "shell", "ipiranga", "combust"], category: "Transporte" },
   { match: ["netflix", "spotify", "prime video", "youtube", "disney"], category: "Assinaturas" },
   { match: ["farmacia", "drogaria", "droga", "venancio"], category: "Farmacia e saude" },
@@ -35,8 +35,7 @@ const CATEGORY_MAP: Array<{ match: string[]; category: string }> = [
   { match: ["curso", "curs", "yescom"], category: "Educacao e eventos" },
   { match: ["jae"], category: "Mobilidade urbana" },
   { match: ["pix", "99pay", "mp ", "mercadopago"], category: "Carteiras e transferencias" },
-  { match: ["bombonieri", "doces", "salgados", "galeto"], category: "Lanches e doces" },
-  { match: ["pao de queijo", "lanchonete"], category: "Cafes e lanches" },
+  { match: ["bombonieri", "doces", "salgados", "pao de queijo", "lanchonete"], category: "Lanches e doces" },
   { match: ["anuidade"], category: "Tarifas do cartao" },
   { match: ["totalpass"], category: "Saude e academia" },
 ];
@@ -44,6 +43,7 @@ const CATEGORY_MAP: Array<{ match: string[]; category: string }> = [
 const ENTRY_PREFIX = /^(\d{2})\/(\d{2})(?:\/(\d{2,4}))?\s+/;
 const MONEY_PATTERN = /-?\d{1,3}(?:\.\d{3})*,\d{2}|-?\d+,\d{2}/g;
 const INSTALLMENT_PATTERN = /(?:parc(?:ela)?\s*)?(\d{1,2})\s*\/\s*(\d{1,2})/i;
+const TIME_PATTERN = /\b([01]?\d|2[0-3]):([0-5]\d)\b/;
 const IGNORED_LINE_TOKENS = [
   "total",
   "pagamento",
@@ -73,7 +73,7 @@ const HARD_SKIP_TOKENS = [
   "reversao de compra",
 ];
 
-export async function parseInvoicePdf(file: File, categoryRules: CategoryRules = {}): Promise<InvoiceDraft> {
+export async function parseInvoicePdf(file: File, categoryRules: MerchantLearningRules = {}): Promise<InvoiceDraft> {
   const buffer = await file.arrayBuffer();
   const pdf = await getDocument({ data: buffer }).promise;
   const tokens: TextToken[] = [];
@@ -100,7 +100,7 @@ export async function parseInvoicePdf(file: File, categoryRules: CategoryRules =
   const text = pageLines.flatMap((page) => page.lines).join("\n");
   const draft = parseInvoiceText(text, file.name, categoryRules);
   const invoiceId = slugify(`${draft.fileName}-${draft.referenceMonth}-${draft.cardName}`) || crypto.randomUUID();
-  const entries = extractEntriesFromPages(pageLines, invoiceId, draft.referenceMonth, categoryRules);
+  const entries = extractEntriesFromPages(pageLines, invoiceId, draft.referenceMonth, draft.cardName, categoryRules);
   const summary = extractInvoiceSummary(pageLines, text);
   const totalAmount = extractOfficialTotalAmount(pageLines, text) || draft.totalAmount;
 
@@ -168,7 +168,7 @@ function buildPageLines(tokens: TextToken[]): Array<{ page: number; lines: strin
 export function parseInvoiceText(
   text: string,
   fileName = "fatura.pdf",
-  categoryRules: CategoryRules = {},
+  categoryRules: MerchantLearningRules = {},
 ): InvoiceDraft {
   const cleanedLines = text
     .split(/\r?\n/)
@@ -195,7 +195,7 @@ export function parseInvoiceText(
       paymentsCredits: 0,
       purchasesDebits: 0,
     },
-    entries: extractEntries(cleanedLines, crypto.randomUUID(), referenceMonth, categoryRules),
+    entries: extractEntries(cleanedLines, crypto.randomUUID(), referenceMonth, cardName, categoryRules),
     sourceText: text,
   };
 }
@@ -381,7 +381,8 @@ function extractEntries(
   lines: string[],
   invoiceId: string,
   referenceMonth: string,
-  categoryRules: CategoryRules,
+  cardName: string,
+  categoryRules: MerchantLearningRules,
 ): InvoiceEntry[] {
   const entries: InvoiceEntry[] = [];
   const year = Number(referenceMonth.slice(0, 4));
@@ -397,25 +398,31 @@ function extractEntries(
       id: crypto.randomUUID(),
       invoiceId,
       date: parsed.date,
+      purchaseTime: parsed.purchaseTime,
       description: parsed.description,
       amount: parsed.amount,
       amountConfidence: parsed.amountConfidence,
-      category: categorizeDescription(parsed.description, categoryRules),
-      person: "",
+      category: categorizeDescription(parsed.description, cardName, categoryRules),
+      person: inferLearnedPerson(parsed.description, cardName, categoryRules),
       notes: "",
       rawLine: line,
       installment: parsed.installment,
+      splitType: "none",
+      splits: [],
+      suspectedDuplicate: false,
+      duplicateKey: null,
     });
   }
 
-  return reconcileReversals(dedupeEntries(entries));
+  return flagDuplicateEntries(reconcileReversals(dedupeEntries(entries)));
 }
 
 function extractEntriesFromPages(
   pages: Array<{ page: number; lines: string[] }>,
   invoiceId: string,
   referenceMonth: string,
-  categoryRules: CategoryRules,
+  cardName: string,
+  categoryRules: MerchantLearningRules,
 ): InvoiceEntry[] {
   const year = Number(referenceMonth.slice(0, 4));
   const month = Number(referenceMonth.slice(5, 7));
@@ -456,19 +463,24 @@ function extractEntriesFromPages(
         id: crypto.randomUUID(),
         invoiceId,
         date: parsed.date,
+        purchaseTime: parsed.purchaseTime,
         description: parsed.description,
         amount: parsed.amount,
         amountConfidence: parsed.amountConfidence,
-        category: categorizeDescription(parsed.description, categoryRules),
-        person: "",
+        category: categorizeDescription(parsed.description, cardName, categoryRules),
+        person: inferLearnedPerson(parsed.description, cardName, categoryRules),
         notes: "",
         rawLine: line,
         installment: parsed.installment,
+        splitType: "none",
+        splits: [],
+        suspectedDuplicate: false,
+        duplicateKey: null,
       });
     }
   }
 
-  return reconcileReversals(dedupeEntries(entries));
+  return flagDuplicateEntries(reconcileReversals(dedupeEntries(entries)));
 }
 
 function parseEntryLine(line: string, statementYear: number, statementMonth: number) {
@@ -504,6 +516,7 @@ function parseEntryLine(line: string, statementYear: number, statementMonth: num
   }
 
   const installment = parseInstallment(descriptionAndValues);
+  const purchaseTime = parsePurchaseTime(descriptionAndValues);
   const amountInfo = chooseAmount(amounts, installment);
   if (!amountInfo || amountInfo.value <= 0) {
     return null;
@@ -522,6 +535,7 @@ function parseEntryLine(line: string, statementYear: number, statementMonth: num
 
   return {
     date: `${String(day).padStart(2, "0")}/${String(parsedMonth).padStart(2, "0")}/${parsedYear}`,
+    purchaseTime,
     description,
     amount: amountInfo.value,
     amountConfidence: amountInfo.confidence,
@@ -577,10 +591,16 @@ function parseInstallment(text: string) {
 
 function cleanupDescription(description: string): string {
   return description
+    .replace(TIME_PATTERN, " ")
     .replace(/\s{2,}/g, " ")
     .replace(/[|]+/g, " ")
     .replace(/\s+-\s+/g, " ")
     .trim();
+}
+
+function parsePurchaseTime(text: string): string {
+  const match = text.match(TIME_PATTERN);
+  return match ? `${match[1].padStart(2, "0")}:${match[2]}` : "";
 }
 
 function parseBrazilianCurrency(value: string): number {
@@ -599,8 +619,12 @@ function adjustYearByStatement(statementYear: number, statementMonth: number, en
   return statementYear;
 }
 
-function categorizeDescription(description: string, categoryRules: CategoryRules): string {
-  const learnedCategory = pickLearnedCategory(description, categoryRules);
+function categorizeDescription(
+  description: string,
+  cardName: string,
+  categoryRules: MerchantLearningRules,
+): string {
+  const learnedCategory = pickLearnedValues(description, cardName, categoryRules)?.category;
   if (learnedCategory) {
     return learnedCategory;
   }
@@ -618,6 +642,14 @@ function categorizeDescription(description: string, categoryRules: CategoryRules
   }
 
   return "Outros / revisar";
+}
+
+function inferLearnedPerson(
+  description: string,
+  cardName: string,
+  categoryRules: MerchantLearningRules,
+): string {
+  return pickLearnedValues(description, cardName, categoryRules)?.person ?? "";
 }
 
 function dedupeEntries(entries: InvoiceEntry[]): InvoiceEntry[] {
@@ -662,4 +694,27 @@ function reconcileReversals(entries: InvoiceEntry[]): InvoiceEntry[] {
 function isReversalEntry(description: string): boolean {
   const normalized = normalizeText(description);
   return normalized.includes("reversao de compra") || normalized.includes("estorno");
+}
+
+function flagDuplicateEntries(entries: InvoiceEntry[]): InvoiceEntry[] {
+  const groups = new Map<string, InvoiceEntry[]>();
+
+  for (const entry of entries) {
+    const duplicateKey = `${entry.description}-${entry.amount}`;
+    const current = groups.get(duplicateKey) ?? [];
+    current.push(entry);
+    groups.set(duplicateKey, current);
+  }
+
+  return entries.map((entry) => {
+    const duplicateKey = `${entry.description}-${entry.amount}`;
+    const siblings = groups.get(duplicateKey) ?? [];
+    const suspectedDuplicate = siblings.length > 1;
+
+    return {
+      ...entry,
+      suspectedDuplicate,
+      duplicateKey: suspectedDuplicate ? duplicateKey : null,
+    };
+  });
 }

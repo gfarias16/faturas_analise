@@ -1,7 +1,15 @@
+export type EntrySplit = {
+  id: string;
+  person: string;
+  amount: number;
+  percentage: number;
+};
+
 export type InvoiceEntry = {
   id: string;
   invoiceId: string;
   date: string;
+  purchaseTime: string;
   description: string;
   amount: number;
   amountConfidence: "high" | "medium";
@@ -13,6 +21,10 @@ export type InvoiceEntry = {
     current: number;
     total: number;
   } | null;
+  splitType: "none" | "percentage" | "fixed";
+  splits: EntrySplit[];
+  suspectedDuplicate: boolean;
+  duplicateKey: string | null;
 };
 
 export type Invoice = {

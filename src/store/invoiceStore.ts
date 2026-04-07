@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useReducer } from "react";
 import type { DashboardFilters, Invoice, InvoiceDraft, InvoiceEntry } from "../types";
-import { buildMerchantSignature, type CategoryRules } from "../lib/categoryLearning";
+import { mergeLearnedValues, type MerchantLearningRules } from "../lib/categoryLearning";
 import { toMonthLabel } from "../lib/format";
 
 const STORAGE_KEY = "faturas-analise-storage-v1";
@@ -8,7 +8,7 @@ const STORAGE_KEY = "faturas-analise-storage-v1";
 type InvoiceState = {
   invoices: Invoice[];
   filters: DashboardFilters;
-  categoryRules: CategoryRules;
+  categoryRules: MerchantLearningRules;
 };
 
 type InvoiceAction =
@@ -17,6 +17,7 @@ type InvoiceAction =
   | { type: "deleteInvoice"; payload: { invoiceId: string } }
   | { type: "setFilters"; payload: Partial<DashboardFilters> }
   | { type: "setCategoryRule"; payload: { signature: string; category: string } }
+  | { type: "setPersonRule"; payload: { signature: string; person: string } }
   | { type: "deleteCategoryRule"; payload: { signature: string } };
 
 const initialState: InvoiceState = {
@@ -59,15 +60,20 @@ function reducer(state: InvoiceState, action: InvoiceAction): InvoiceState {
       const currentInvoice = state.invoices.find((invoice) => invoice.id === action.payload.invoiceId);
       const currentEntry = currentInvoice?.entries.find((entry) => entry.id === action.payload.entryId);
       const nextDescription = action.payload.changes.description ?? currentEntry?.description ?? "";
-      const nextCategory = action.payload.changes.category;
-      const nextRules = { ...state.categoryRules };
-
-      if (nextCategory && nextDescription) {
-        const signature = buildMerchantSignature(nextDescription);
-        if (signature) {
-          nextRules[signature] = nextCategory;
-        }
-      }
+      const nextCategory = action.payload.changes.category ?? currentEntry?.category;
+      const nextPerson = action.payload.changes.person ?? currentEntry?.person;
+      const nextRules =
+        nextDescription && currentInvoice
+          ? mergeLearnedValues({
+              rules: state.categoryRules,
+              description: nextDescription,
+              cardName: currentInvoice.cardName,
+              updates: {
+                category: nextCategory?.trim() || undefined,
+                person: nextPerson?.trim() || undefined,
+              },
+            })
+          : state.categoryRules;
 
       return {
         ...state,
@@ -111,7 +117,27 @@ function reducer(state: InvoiceState, action: InvoiceAction): InvoiceState {
         ...state,
         categoryRules: {
           ...state.categoryRules,
-          [signature]: category,
+          [signature]: {
+            ...(state.categoryRules[signature] ?? {}),
+            category,
+          },
+        },
+      };
+    }
+    case "setPersonRule": {
+      const signature = action.payload.signature.trim();
+      if (!signature) {
+        return state;
+      }
+
+      return {
+        ...state,
+        categoryRules: {
+          ...state.categoryRules,
+          [signature]: {
+            ...(state.categoryRules[signature] ?? {}),
+            person: action.payload.person.trim(),
+          },
         },
       };
     }
@@ -151,8 +177,18 @@ function loadState(): InvoiceState {
         },
         entries: invoice.entries.map((entry) => ({
           ...entry,
+          purchaseTime: entry.purchaseTime ?? "",
           amountConfidence: entry.amountConfidence ?? "high",
           installment: entry.installment ?? null,
+          splitType: entry.splitType ?? "none",
+          splits: (entry.splits ?? []).map((split) => ({
+            id: split.id ?? crypto.randomUUID(),
+            person: split.person ?? "",
+            amount: split.amount ?? 0,
+            percentage: split.percentage ?? 0,
+          })),
+          suspectedDuplicate: entry.suspectedDuplicate ?? false,
+          duplicateKey: entry.duplicateKey ?? null,
         })),
       })),
       filters: {
@@ -160,7 +196,7 @@ function loadState(): InvoiceState {
         ...parsed.filters,
         categories: Array.isArray(parsed.filters?.categories) ? parsed.filters.categories : [],
       },
-      categoryRules: parsed.categoryRules ?? {},
+      categoryRules: migrateLearningRules(parsed.categoryRules),
     };
   } catch {
     return initialState;
@@ -187,6 +223,8 @@ export function useInvoiceStore() {
     setFilters: (payload: Partial<DashboardFilters>) => dispatch({ type: "setFilters", payload }),
     setCategoryRule: (signature: string, category: string) =>
       dispatch({ type: "setCategoryRule", payload: { signature, category } }),
+    setPersonRule: (signature: string, person: string) =>
+      dispatch({ type: "setPersonRule", payload: { signature, person } }),
     deleteCategoryRule: (signature: string) =>
       dispatch({ type: "deleteCategoryRule", payload: { signature } }),
   };
@@ -199,7 +237,14 @@ function buildSelectors(state: InvoiceState) {
   }));
   const cards = uniqueValues(state.invoices.map((invoice) => invoice.cardName));
   const people = uniqueValues(
-    state.invoices.flatMap((invoice) => invoice.entries.map((entry) => entry.person)).filter(Boolean),
+    state.invoices
+      .flatMap((invoice) =>
+        invoice.entries.flatMap((entry) => [
+          entry.person,
+          ...entry.splits.map((split) => split.person),
+        ]),
+      )
+      .filter(Boolean),
   );
   const categories = uniqueValues(state.invoices.flatMap((invoice) => invoice.entries.map((entry) => entry.category)));
 
@@ -218,7 +263,9 @@ function buildSelectors(state: InvoiceState) {
   const filteredEntries = filteredInvoices.flatMap((invoice) =>
     invoice.entries.filter(
       (entry) =>
-        (state.filters.person === "all" || entry.person === state.filters.person) &&
+        (state.filters.person === "all" ||
+          entry.person === state.filters.person ||
+          entry.splits.some((split) => split.person === state.filters.person)) &&
         (state.filters.categories.length === 0 || state.filters.categories.includes(entry.category)),
     ),
   );
@@ -231,6 +278,47 @@ function buildSelectors(state: InvoiceState) {
     filteredInvoices,
     filteredEntries,
   };
+}
+
+function migrateLearningRules(value: unknown): MerchantLearningRules {
+  if (!value || typeof value !== "object") {
+    return {};
+  }
+
+  const nextRules: MerchantLearningRules = {};
+
+  for (const [signature, rawRule] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof rawRule === "string") {
+      nextRules[signature] = { category: rawRule };
+      continue;
+    }
+
+    if (!rawRule || typeof rawRule !== "object") {
+      continue;
+    }
+
+    const rule = rawRule as {
+      category?: unknown;
+      person?: unknown;
+      byCard?: Record<string, { category?: unknown; person?: unknown }>;
+    };
+
+    nextRules[signature] = {
+      category: typeof rule.category === "string" ? rule.category : undefined,
+      person: typeof rule.person === "string" ? rule.person : undefined,
+      byCard: Object.fromEntries(
+        Object.entries(rule.byCard ?? {}).map(([card, cardRule]) => [
+          card,
+          {
+            category: typeof cardRule?.category === "string" ? cardRule.category : undefined,
+            person: typeof cardRule?.person === "string" ? cardRule.person : undefined,
+          },
+        ]),
+      ),
+    };
+  }
+
+  return nextRules;
 }
 
 function uniqueValues(values: string[]): string[] {
