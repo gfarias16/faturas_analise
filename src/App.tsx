@@ -27,6 +27,7 @@ import { parseInvoicePdf } from "./lib/pdfParser";
 import {
   buildDiscrepancyItems,
   buildFutureInstallments,
+  buildReconciliationItems,
   aggregateCategoryEntries,
   aggregatePersonEntries,
   createSplit,
@@ -43,6 +44,8 @@ const THEME_STORAGE_KEY = "faturas-analise-theme";
 const CHART_COLORS = ["#2f6bff", "#58a6ff", "#123a7a", "#75d0ff", "#5d7cff", "#8cb8ff"];
 
 export default function App() {
+  const PAGE_SIZE = 10;
+  const RULES_PAGE_SIZE = 6;
   const {
     state,
     selectors,
@@ -58,6 +61,9 @@ export default function App() {
   const [isImporting, setIsImporting] = useState(false);
   const [error, setError] = useState("");
   const [ruleSearch, setRuleSearch] = useState("");
+  const [currentEntriesPage, setCurrentEntriesPage] = useState(1);
+  const [currentRulesPage, setCurrentRulesPage] = useState(1);
+  const [expandedEntryId, setExpandedEntryId] = useState<string | null>(null);
   const [theme, setTheme] = useState<"gradient" | "light">(() => {
     const stored = localStorage.getItem(THEME_STORAGE_KEY);
     return stored === "light" ? "light" : "gradient";
@@ -74,6 +80,8 @@ export default function App() {
     selectors.filteredInvoices.map((invoice) => invoice.dueDate).filter(Boolean),
   );
   const selectedCategories = state.filters.categories;
+  const knownPeople = selectors.people;
+  const suggestedPeople = knownPeople.slice(0, 6);
   const learnedRules = useMemo(
     () =>
       Object.entries(categoryRules)
@@ -96,6 +104,13 @@ export default function App() {
     );
   }, [learnedRules, ruleSearch]);
 
+  // Pagina as regras aprendidas para manter a tela leve quando a base crescer.
+  const totalRulesPages = Math.max(1, Math.ceil(filteredLearnedRules.length / RULES_PAGE_SIZE));
+  const paginatedLearnedRules = useMemo(() => {
+    const start = (currentRulesPage - 1) * RULES_PAGE_SIZE;
+    return filteredLearnedRules.slice(start, start + RULES_PAGE_SIZE);
+  }, [currentRulesPage, filteredLearnedRules, RULES_PAGE_SIZE]);
+
   const uncategorizedEntries = selectors.filteredEntries
     .filter((entry) => entry.category === "Outros / revisar")
     .slice(0, 8);
@@ -107,6 +122,10 @@ export default function App() {
   const installmentCount = selectors.filteredEntries.filter((entry) => entry.installment).length;
   const discrepancyItems = useMemo(
     () => buildDiscrepancyItems(selectors.filteredInvoices),
+    [selectors.filteredInvoices],
+  );
+  const reconciliationItems = useMemo(
+    () => buildReconciliationItems(selectors.filteredInvoices),
     [selectors.filteredInvoices],
   );
   const entriesImportedTotal = useMemo(
@@ -121,7 +140,16 @@ export default function App() {
       ),
     [selectors.filteredInvoices],
   );
+  const purchasesFilteredTotal = useMemo(
+    () =>
+      selectors.filteredInvoices.reduce(
+        (sum, invoice) => sum + (invoice.summary.purchasesDebits || sumEntries(invoice.entries)),
+        0,
+      ),
+    [selectors.filteredInvoices],
+  );
   const entriesDifference = entriesImportedTotal - officialFilteredTotal;
+  const purchasesDifference = entriesImportedTotal - purchasesFilteredTotal;
   const projectedInstallments = useMemo(
     () => buildFutureInstallments(selectors.filteredInvoices),
     [selectors.filteredInvoices],
@@ -170,6 +198,49 @@ export default function App() {
       .sort((a, b) => a[0].localeCompare(b[0]))
       .map(([label, value]) => ({ label: toMonthLabel(label), value }));
   }, [state.invoices]);
+
+  // Mantem o vinculo entre lancamento e fatura de origem, mas organiza tudo em uma lista paginada.
+  const filteredEntryRows = useMemo(
+    () =>
+      selectors.filteredInvoices.flatMap((invoice) =>
+        invoice.entries
+          .filter((entry) => matchesEntryFilters(entry, invoice, state.filters))
+          .map((entry) => ({
+            invoiceId: invoice.id,
+            entry,
+          })),
+      ),
+    [selectors.filteredInvoices, state.filters],
+  );
+
+  const totalEntriesPages = Math.max(1, Math.ceil(filteredEntryRows.length / PAGE_SIZE));
+  const paginatedEntryRows = useMemo(() => {
+    const start = (currentEntriesPage - 1) * PAGE_SIZE;
+    return filteredEntryRows.slice(start, start + PAGE_SIZE);
+  }, [currentEntriesPage, filteredEntryRows, PAGE_SIZE]);
+
+  useEffect(() => {
+    setCurrentEntriesPage((current) => Math.min(current, totalEntriesPages));
+  }, [totalEntriesPages]);
+
+  useEffect(() => {
+    setCurrentEntriesPage(1);
+    setExpandedEntryId(null);
+  }, [state.filters, state.invoices.length]);
+
+  useEffect(() => {
+    if (expandedEntryId && !paginatedEntryRows.some(({ entry }) => entry.id == expandedEntryId)) {
+      setExpandedEntryId(null);
+    }
+  }, [expandedEntryId, paginatedEntryRows]);
+
+  useEffect(() => {
+    setCurrentRulesPage((current) => Math.min(current, totalRulesPages));
+  }, [totalRulesPages]);
+
+  useEffect(() => {
+    setCurrentRulesPage(1);
+  }, [ruleSearch, learnedRules.length]);
 
   async function handleImport(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
@@ -319,12 +390,12 @@ export default function App() {
         <section className="panel review-panel">
           <div className="panel-heading"><AlertCircle size={18} /><h2>Painel de revisao</h2></div>
           <div className="review-summary-grid">
-            <article className="review-summary-card"><strong>{discrepancyItems.length}</strong><span>Faturas com divergencia</span><small>Total oficial x lancamentos importados.</small></article>
+            <article className="review-summary-card"><strong>{discrepancyItems.length}</strong><span>Faturas nao conciliadas</span><small>Separa diferenca de compras da diferenca do total oficial.</small></article>
             <article className="review-summary-card"><strong>{duplicateEntries.length}</strong><span>Duplicidades potenciais</span><small>Mesmo estabelecimento e valor repetidos.</small></article>
             <article className="review-summary-card"><strong>{unassignedEntries.length}</strong><span>Sem pessoa ou rateio</span><small>Itens ainda sem distribuicao.</small></article>
           </div>
           <div className="review-sections">
-            <ReviewGroup title="Divergencia da fatura" items={discrepancyItems.map((item) => ({ key: item.invoiceId, title: item.title, lines: [`Total oficial: ${toCurrency(item.officialTotal)}`, `Lancamentos: ${toCurrency(item.importedTotal)}`], foot: `Diferenca: ${toCurrency(item.difference)}` }))} emptyText="Nao ha divergencia entre total oficial e soma dos lancamentos no recorte atual." />
+            <ReviewGroup title="Valores nao conciliados" items={discrepancyItems.map((item) => ({ key: item.invoiceId, title: item.title, lines: [`Resumo de compras: ${toCurrency(item.purchasesDebits)}`, `Lancamentos importados: ${toCurrency(item.importedTotal)}`, `Dif. compras: ${toCurrency(item.differenceToPurchases)}`, `Total oficial: ${toCurrency(item.officialTotal)}`, `Saldo anterior: ${toCurrency(item.previousBalance)}`, `Creditos/pagamentos: ${toCurrency(item.paymentsCredits)}`], foot: item.hint }))} emptyText="Nao ha divergencia relevante entre compras, lancamentos e total oficial no recorte atual." />
             <ReviewGroup title="Possiveis duplicidades" items={duplicateEntries.slice(0, 8).map((entry) => ({ key: entry.id, title: entry.description, lines: [formatEntryDateMeta(entry.date, entry.purchaseTime)], foot: toCurrency(entry.amount) }))} emptyText="Nao encontramos duplicidades potenciais nos filtros atuais." />
             <ReviewGroup title="Categorias para revisar" items={uncategorizedEntries.map((entry) => ({ key: entry.id, title: entry.description, lines: [formatEntryDateMeta(entry.date, entry.purchaseTime)], foot: toCurrency(entry.amount) }))} emptyText="Nenhum item pendente de classificacao detalhada para os filtros atuais." />
           </div>
@@ -402,27 +473,51 @@ export default function App() {
           )}
         </section>
 
-        <section className="panel learned-rules-panel">
+        <section className="panel learned-rules-panel compact-rules-panel">
           <div className="panel-heading space-between"><div className="panel-heading"><PieChart size={18} /><h2>Regras aprendidas</h2></div><span>{learnedRules.length} salvas</span></div>
-          <div className="rules-toolbar">
-            <input type="text" placeholder="Buscar por estabelecimento, categoria ou pessoa" value={ruleSearch} onChange={(e) => setRuleSearch(e.target.value)} />
-            {ruleSearch ? <span>{filteredLearnedRules.length} encontradas</span> : null}
+          <div className="rules-toolbar compact-toolbar">
+            <input type="text" className="compact-input" placeholder="Buscar por estabelecimento, categoria ou pessoa" value={ruleSearch} onChange={(e) => setRuleSearch(e.target.value)} />
+            <span>{filteredLearnedRules.length} no filtro</span>
+            <div className="pagination-controls">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => setCurrentRulesPage((current) => Math.max(1, current - 1))}
+                disabled={currentRulesPage === 1}
+              >
+                Anterior
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => setCurrentRulesPage((current) => Math.min(totalRulesPages, current + 1))}
+                disabled={currentRulesPage === totalRulesPages}
+              >
+                Proxima
+              </button>
+            </div>
           </div>
           {learnedRules.length === 0 ? <EmptyState text="As regras aparecem aqui quando voce corrige categorias ou pessoas de estabelecimentos recorrentes." /> : filteredLearnedRules.length === 0 ? <EmptyState text="Nenhuma regra encontrada para esse termo de busca." /> : (
-            <div className="rules-list">
-              {filteredLearnedRules.map((rule) => (
-                <article className="rule-card" key={rule.signature}>
-                  <div className="rule-copy"><strong>{rule.signature}</strong><small>Padrao aprendido para novos imports</small></div>
-                  <div className="rule-actions rule-actions-wide">
-                    <select value={rule.category} onChange={(e) => setCategoryRule(rule.signature, e.target.value)}>
-                      {uniqueTextValues([rule.category, ...selectors.categories].filter(Boolean)).map((item) => <option key={item} value={item}>{item}</option>)}
-                    </select>
-                    <input type="text" placeholder="Pessoa padrao" value={rule.person} onChange={(e) => setPersonRule(rule.signature, e.target.value)} />
-                    <button type="button" className="icon-button" onClick={() => deleteCategoryRule(rule.signature)} aria-label={`Excluir regra ${rule.signature}`}><Trash2 size={16} /></button>
-                  </div>
-                </article>
-              ))}
-            </div>
+            <>
+              <div className="rules-meta">
+                <span>Pagina {currentRulesPage} de {totalRulesPages}</span>
+                <span>Mostrando {paginatedLearnedRules.length} regras</span>
+              </div>
+              <div className="rules-list compact-rules-list">
+                {paginatedLearnedRules.map((rule) => (
+                  <article className="rule-card compact-rule-card" key={rule.signature}>
+                    <div className="rule-copy compact-rule-copy"><strong>{rule.signature}</strong><small>Padrao para novos imports</small></div>
+                    <div className="rule-actions compact-rule-actions">
+                      <select className="compact-input" value={rule.category} onChange={(e) => setCategoryRule(rule.signature, e.target.value)}>
+                        {uniqueTextValues([rule.category, ...selectors.categories].filter(Boolean)).map((item) => <option key={item} value={item}>{item}</option>)}
+                      </select>
+                      <input className="compact-input" type="text" placeholder="Pessoa padrao" value={rule.person} onChange={(e) => setPersonRule(rule.signature, e.target.value)} />
+                      <button type="button" className="icon-button small-icon-button" onClick={() => deleteCategoryRule(rule.signature)} aria-label={`Excluir regra ${rule.signature}`}><Trash2 size={16} /></button>
+                    </div>
+                  </article>
+                ))}
+              </div>
+            </>
           )}
         </section>
 
@@ -445,82 +540,183 @@ export default function App() {
         <section className="panel table-panel">
           <div className="panel-heading space-between">
             <div className="panel-heading"><UserRound size={18} /><h2>Lancamentos editaveis</h2></div>
-            <div className="entry-summary-strip">
-              <span>Total da fatura <strong>{toCurrency(officialFilteredTotal)}</strong></span>
+            <div className="entry-summary-strip compact-summary-strip">
+              <span>Total fatura <strong>{toCurrency(officialFilteredTotal)}</strong></span>
+              <span>Compras <strong>{toCurrency(purchasesFilteredTotal)}</strong></span>
               <span>Lancamentos <strong>{toCurrency(entriesImportedTotal)}</strong></span>
+              <span className={Math.abs(purchasesDifference) < 0.01 ? "difference-ok" : "difference-warning"}>
+                Dif. compras <strong>{toCurrency(purchasesDifference)}</strong>
+              </span>
               <span className={Math.abs(entriesDifference) < 0.01 ? "difference-ok" : "difference-warning"}>
-                Diferenca <strong>{toCurrency(entriesDifference)}</strong>
+                Dif. fatura <strong>{toCurrency(entriesDifference)}</strong>
               </span>
             </div>
           </div>
+
+          <div className="table-toolbar compact-toolbar">
+            <span>Pagina {currentEntriesPage} de {totalEntriesPages}</span>
+            <span>{paginatedEntryRows.length} de {filteredEntryRows.length} lancamentos</span>
+            <div className="pagination-controls">
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => setCurrentEntriesPage((current) => Math.max(1, current - 1))}
+                disabled={currentEntriesPage === 1}
+              >
+                Anterior
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => setCurrentEntriesPage((current) => Math.min(totalEntriesPages, current + 1))}
+                disabled={currentEntriesPage === totalEntriesPages}
+              >
+                Proxima
+              </button>
+            </div>
+          </div>
+
           {selectors.filteredEntries.length === 0 ? <EmptyState text="Nenhum lancamento encontrado para os filtros atuais." /> : (
-            <div className="table-scroll">
-              <table>
-                <thead><tr><th>Data</th><th>Descricao</th><th>Categoria</th><th>Pessoas e divisao</th><th>Valor</th><th>Observacoes</th></tr></thead>
-                <tbody>
-                  {selectors.filteredInvoices.map((invoice) => invoice.entries.filter((entry) => matchesEntryFilters(entry, invoice, state.filters)).map((entry) => (
-                    <tr key={entry.id}>
-                      <td>
-                        <div className="date-cell">
-                          <input type="date" value={toInputDate(entry.date)} onChange={(e) => updateEntry(invoice.id, entry.id, { date: fromInputDate(e.target.value) })} />
-                          <small>{formatEntryDateMeta(entry.date, entry.purchaseTime)}</small>
+            <div className="compact-entry-list">
+              {paginatedEntryRows.map(({ invoiceId, entry }) => {
+                const isExpanded = expandedEntryId === entry.id;
+
+                return (
+                  <article className="entry-compact-card" key={entry.id}>
+                    <button
+                      type="button"
+                      className="entry-compact-summary"
+                      onClick={() => setExpandedEntryId((current) => current === entry.id ? null : entry.id)}
+                    >
+                      <div className="entry-main">
+                        <div className="entry-topline">
+                          <strong>{entry.description}</strong>
+                          <span className="entry-compact-amount">{toCurrency(entry.amount)}</span>
                         </div>
-                      </td>
-                      <td>
-                        <div className="description-cell">
-                          <input type="text" value={entry.description} onChange={(e) => updateEntry(invoice.id, entry.id, { description: e.target.value })} />
-                          <div className="entry-tags">
-                            {entry.installment ? <span className="entry-tag">Parcela {entry.installment.current}/{entry.installment.total}</span> : null}
-                            {entry.amountConfidence === "medium" ? <span className="entry-tag warning-tag">Revisar valor</span> : <span className="entry-tag success-tag">Valor confiavel</span>}
-                            {entry.suspectedDuplicate ? <span className="entry-tag warning-tag">Possivel duplicidade</span> : null}
-                          </div>
+                        <div className="entry-meta-row">
+                          <span>{entry.date}</span>
+                          <span>{formatEntryDateMeta(entry.date, entry.purchaseTime)}</span>
+                          <span>{entry.category}</span>
+                          <span>{entry.person || "Sem responsavel"}</span>
                         </div>
-                      </td>
-                      <td><input type="text" value={entry.category} onChange={(e) => updateEntry(invoice.id, entry.id, { category: e.target.value })} /></td>
-                      <td>
-                        <div className="split-editor">
-                          <input type="text" className="compact-input" placeholder="Responsavel principal" value={entry.person} onChange={(e) => updateEntry(invoice.id, entry.id, { person: e.target.value })} />
-                          <select value={entry.splitType} onChange={(e) => handleSplitTypeChange(invoice.id, entry, e.target.value as InvoiceEntry["splitType"])}>
-                            <option value="none">Vai 100% para uma pessoa</option>
-                            <option value="percentage">Dividir igualmente entre varias pessoas</option>
-                            <option value="fixed">Dividir com valores personalizados</option>
-                          </select>
+                        <div className="entry-tags compact-tags">
+                          {entry.installment ? <span className="entry-tag">Parcela {entry.installment.current}/{entry.installment.total}</span> : null}
+                          {entry.amountConfidence === "medium" ? <span className="entry-tag warning-tag">Revisar valor</span> : <span className="entry-tag success-tag">Valor confiavel</span>}
+                          {entry.suspectedDuplicate ? <span className="entry-tag warning-tag">Possivel duplicidade</span> : null}
+                        </div>
+                      </div>
+                      <span className="entry-expand-button">{isExpanded ? "Ocultar detalhes" : "Abrir detalhes"}</span>
+                    </button>
+
+                    {isExpanded ? (
+                      <div className="entry-expanded-panel">
+                        {/* Mantem a edicao completa, mas so mostra quando o usuario decide abrir um lancamento especifico. */}
+                        <div className="entry-form-grid">
+                          <label className="entry-inline-field">
+                            <span>Data</span>
+                            <input type="date" className="compact-input" value={toInputDate(entry.date)} onChange={(e) => updateEntry(invoiceId, entry.id, { date: fromInputDate(e.target.value) })} />
+                          </label>
+                          <label className="entry-inline-field">
+                            <span>Descricao</span>
+                            <input type="text" className="compact-input" value={entry.description} onChange={(e) => updateEntry(invoiceId, entry.id, { description: e.target.value })} />
+                          </label>
+                          <label className="entry-inline-field">
+                            <span>Categoria</span>
+                            <input type="text" className="compact-input" value={entry.category} onChange={(e) => updateEntry(invoiceId, entry.id, { category: e.target.value })} />
+                          </label>
+                          <label className="entry-inline-field">
+                            <span>Responsavel</span>
+                            <input
+                              type="text"
+                              list="known-people-options"
+                              className="compact-input"
+                              placeholder="Responsavel"
+                              value={entry.person}
+                              onChange={(e) => updateEntry(invoiceId, entry.id, { person: e.target.value })}
+                            />
+                          </label>
+                        </div>
+
+                        {suggestedPeople.length > 0 ? (
+                          <QuickPeopleChips
+                            people={suggestedPeople}
+                            onSelect={(person) => updateEntry(invoiceId, entry.id, { person })}
+                            compact
+                          />
+                        ) : null}
+
+                        <div className="entry-inline-stack">
+                          <label className="entry-inline-field">
+                            <span>Divisao</span>
+                            <select className="compact-input" value={entry.splitType} onChange={(e) => handleSplitTypeChange(invoiceId, entry, e.target.value as InvoiceEntry["splitType"])}>
+                              <option value="none">100% para uma pessoa</option>
+                              <option value="percentage">Dividir igualmente</option>
+                              <option value="fixed">Dividir por valor</option>
+                            </select>
+                          </label>
+
                           {entry.splitType !== "none" ? (
-                            <div className="split-list">
+                            <div className="split-list compact-split-list">
                               {entry.splits.map((split) => (
                                 <div className="split-row" key={split.id}>
-                                  <input type="text" className="compact-input" placeholder="Pessoa" value={split.person} onChange={(e) => handleSplitChange(invoice.id, entry, split.id, "person", e.target.value)} />
+                                  <div className="split-person-field">
+                                    <input
+                                      type="text"
+                                      list="known-people-options"
+                                      className="compact-input"
+                                      placeholder="Pessoa"
+                                      value={split.person}
+                                      onChange={(e) => handleSplitChange(invoiceId, entry, split.id, "person", e.target.value)}
+                                    />
+                                    {suggestedPeople.length > 0 ? (
+                                      <QuickPeopleChips
+                                        people={suggestedPeople}
+                                        onSelect={(person) => handleSplitChange(invoiceId, entry, split.id, "person", person)}
+                                        compact
+                                      />
+                                    ) : null}
+                                  </div>
                                   {entry.splitType === "percentage" ? (
                                     <div className="split-readonly">
                                       <strong>{toCurrency(split.amount)}</strong>
                                       <span>{split.percentage.toFixed(2)}%</span>
                                     </div>
                                   ) : (
-                                    <input type="number" className="compact-input" step="0.01" placeholder="R$" value={split.amount.toFixed(2)} onChange={(e) => handleSplitChange(invoice.id, entry, split.id, "amount", e.target.value)} />
+                                    <input type="number" className="compact-input" step="0.01" placeholder="R$" value={split.amount.toFixed(2)} onChange={(e) => handleSplitChange(invoiceId, entry, split.id, "amount", e.target.value)} />
                                   )}
-                                  <button type="button" className="icon-button small-icon-button" onClick={() => handleRemoveSplit(invoice.id, entry, split.id)}><Trash2 size={14} /></button>
+                                  <button type="button" className="icon-button small-icon-button" onClick={() => handleRemoveSplit(invoiceId, entry, split.id)}><Trash2 size={14} /></button>
                                 </div>
                               ))}
-                              <div className="split-footer">
+                              <div className="split-footer compact-split-footer">
                                 <small>{summarizeSplits(entry)}</small>
-                                <button type="button" className="secondary-button" onClick={() => handleAddSplit(invoice.id, entry)}>
-                                  Adicionar outra pessoa
+                                <button type="button" className="secondary-button" onClick={() => handleAddSplit(invoiceId, entry)}>
+                                  Adicionar pessoa
                                 </button>
                               </div>
                             </div>
                           ) : null}
                         </div>
-                      </td>
-                      <td className="amount-cell">{toCurrency(entry.amount)}</td>
-                      <td><input type="text" value={entry.notes} onChange={(e) => updateEntry(invoice.id, entry.id, { notes: e.target.value })} /></td>
-                    </tr>
-                  )))}
-                </tbody>
-              </table>
+
+                        <label className="entry-inline-field entry-notes-row">
+                          <span>Observacoes</span>
+                          <input type="text" className="compact-input" value={entry.notes} onChange={(e) => updateEntry(invoiceId, entry.id, { notes: e.target.value })} />
+                        </label>
+                      </div>
+                    ) : null}
+                  </article>
+                );
+              })}
             </div>
           )}
         </section>
       </main>
+
+      {/* Sugere nomes ja conhecidos pelo sistema para acelerar o preenchimento de pessoa e rateio. */}
+      <datalist id="known-people-options">
+        {knownPeople.map((person) => (
+          <option key={person} value={person} />
+        ))}
+      </datalist>
     </div>
   );
 }
@@ -550,6 +746,27 @@ function ReviewGroup({
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+function QuickPeopleChips({
+  people,
+  onSelect,
+  compact = false,
+}: {
+  people: string[];
+  onSelect: (person: string) => void;
+  compact?: boolean;
+}) {
+  return (
+    <div className={compact ? "people-suggestions compact-suggestions" : "people-suggestions"}>
+      {/* Atalhos para pessoas ja conhecidas no sistema, reduzindo digitacao repetida. */}
+      {people.map((person) => (
+        <button key={person} type="button" className="person-chip" onClick={() => onSelect(person)}>
+          {person}
+        </button>
+      ))}
     </div>
   );
 }

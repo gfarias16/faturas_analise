@@ -1,6 +1,19 @@
 import { toMonthLabel } from "./format";
 import type { ChartDatum, EntrySplit, Invoice, InvoiceEntry } from "../types";
 
+export type ReconciliationItem = {
+  invoiceId: string;
+  title: string;
+  officialTotal: number;
+  importedTotal: number;
+  purchasesDebits: number;
+  previousBalance: number;
+  paymentsCredits: number;
+  differenceToOfficial: number;
+  differenceToPurchases: number;
+  hint: string;
+};
+
 export function aggregateCategoryEntries(entries: InvoiceEntry[]): ChartDatum[] {
   const totals = new Map<string, number>();
 
@@ -43,21 +56,40 @@ export function sumEntries(entries: Array<{ amount: number }>): number {
 }
 
 export function buildDiscrepancyItems(invoices: Invoice[]) {
-  return invoices
-    .map((invoice) => {
-      const importedTotal = sumEntries(invoice.entries);
-      const officialTotal = invoice.totalAmount || importedTotal;
-      const difference = importedTotal - officialTotal;
+  return buildReconciliationItems(invoices).filter(
+    (item) => Math.abs(item.differenceToOfficial) >= 0.01 || Math.abs(item.differenceToPurchases) >= 0.01,
+  );
+}
 
-      return {
-        invoiceId: invoice.id,
-        title: `${invoice.cardName} - ${toMonthLabel(invoice.referenceMonth)}`,
-        officialTotal,
-        importedTotal,
-        difference,
-      };
-    })
-    .filter((item) => Math.abs(item.difference) >= 0.01);
+export function buildReconciliationItems(invoices: Invoice[]): ReconciliationItem[] {
+  return invoices.map((invoice) => {
+    const importedTotal = sumEntries(invoice.entries);
+    const officialTotal = invoice.totalAmount || importedTotal;
+    const purchasesDebits = invoice.summary.purchasesDebits || importedTotal;
+    const previousBalance = invoice.summary.previousBalance || 0;
+    const paymentsCredits = invoice.summary.paymentsCredits || 0;
+    const differenceToOfficial = roundCurrency(importedTotal - officialTotal);
+    const differenceToPurchases = roundCurrency(importedTotal - purchasesDebits);
+
+    return {
+      invoiceId: invoice.id,
+      title: `${invoice.cardName} - ${toMonthLabel(invoice.referenceMonth)}`,
+      officialTotal,
+      importedTotal,
+      purchasesDebits,
+      previousBalance,
+      paymentsCredits,
+      differenceToOfficial,
+      differenceToPurchases,
+      // Explica a causa mais provavel para a divergencia, separando falta de lancamento de itens financeiros.
+      hint: inferReconciliationHint({
+        differenceToOfficial,
+        differenceToPurchases,
+        previousBalance,
+        paymentsCredits,
+      }),
+    };
+  });
 }
 
 export function buildFutureInstallments(invoices: Invoice[]) {
@@ -167,6 +199,36 @@ export function summarizeSplits(entry: InvoiceEntry): string {
   }
 
   return `Rateado: ${formatCurrencyCompact(totalAmount)}. Diferenca: ${formatCurrencyCompact(amountDifference)}.`;
+}
+
+function inferReconciliationHint({
+  differenceToOfficial,
+  differenceToPurchases,
+  previousBalance,
+  paymentsCredits,
+}: {
+  differenceToOfficial: number;
+  differenceToPurchases: number;
+  previousBalance: number;
+  paymentsCredits: number;
+}) {
+  if (Math.abs(differenceToPurchases) >= 0.01) {
+    if (differenceToPurchases < 0) {
+      return "Provavel falta de lancamentos ou debitos nao importados na leitura do PDF.";
+    }
+
+    return "Os lancamentos importados ficaram acima do resumo de compras. Vale revisar duplicidades ou leitura indevida.";
+  }
+
+  if (Math.abs(differenceToOfficial) >= 0.01) {
+    if (previousBalance > 0 || paymentsCredits > 0) {
+      return "As compras importadas batem com o resumo de compras. A diferenca para o total oficial parece vir de saldo anterior, creditos, pagamentos ou outros ajustes financeiros.";
+    }
+
+    return "As compras importadas batem com o resumo de compras, mas o total oficial ainda difere. Verifique tarifas, encargos ou ajustes fora da tabela principal.";
+  }
+
+  return "Conciliacao ok: compras importadas e total oficial estao alinhados.";
 }
 
 function addMonths(monthKey: string, offset: number): string {
